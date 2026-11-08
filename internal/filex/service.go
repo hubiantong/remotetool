@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -37,9 +38,16 @@ const pumpBuf = 256 << 10
 
 // Progress reports transfer state to the UI.
 type Progress struct {
-	ID        string `json:"id"`
-	PeerID    string `json:"peer_id"`
-	Direction string `json:"direction"` // "push" (to peer) / "pull" (from peer)
+	ID     string `json:"id"`
+	PeerID string `json:"peer_id"`
+	// Direction is the byte-flow direction from THIS device's point of view
+	// and is always one of exactly two values:
+	//   - "push": this device sends the file bytes (an outgoing transfer — a
+	//     local PushFile/PushDir, or the serving side of a peer's pull);
+	//   - "pull": this device receives the file bytes.
+	// The web UI compares against the literal "push" (everything else renders
+	// as an incoming arrow), so the spelling is part of the protocol.
+	Direction string `json:"direction"`
 	LocalPath string `json:"local_path"`
 	Name      string `json:"name"`
 	Size      int64  `json:"size"`
@@ -71,7 +79,7 @@ func (s *Service) progress(p Progress) {
 	}
 }
 
-func (s *Service) Name() string   { return "file" }
+func (s *Service) Name() string     { return "file" }
 func (s *Service) Chan() proto.Chan { return proto.ChanFile }
 
 // -------------------------------------------------------------- RPC types ---
@@ -187,7 +195,7 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		return s.prepareRecv(p.ID, p.Path, p.Size, true, p.Conflict)
+		return s.prepareRecv(p.ID, p.Path, p.Size, true, p.Conflict, peer.ID)
 	})
 	rc.Handle("xfer.pull", func(params json.RawMessage) (any, error) {
 		var p pullParams
@@ -212,12 +220,25 @@ func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
+		s.mu.Lock()
+		rs := s.recv[p.ID]
+		s.mu.Unlock()
+		// Identical error for unknown id and foreign caller: no existence leak.
+		if rs == nil || rs.peerID != peer.ID {
+			return nil, fmt.Errorf("no such transfer %s", p.ID)
+		}
 		return nil, s.finalize(p.ID, p.Sha256)
 	})
 	rc.Handle("xfer.cancel", func(params json.RawMessage) (any, error) {
 		var p cancelParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
+		}
+		s.mu.Lock()
+		rs := s.recv[p.ID]
+		s.mu.Unlock()
+		if rs == nil || rs.peerID != peer.ID {
+			return nil, fmt.Errorf("no such transfer %s", p.ID)
 		}
 		s.cancel(p.ID)
 		return nil, nil
@@ -295,16 +316,19 @@ type recvState struct {
 	offset    int64
 	size      int64 // may be 0 until known
 	sizeKnown bool
-	peerID    string
+	peerID    string // owning peer, fixed at prepareRecv time
 	finOnce   sync.Once
 	finDone   chan struct{}
 	finErr    error
 	ready     chan struct{} // closed once expected is set
+	readyOnce sync.Once
 	muSt      sync.Mutex
 }
 
-// prepareRecv sets up (or resumes) an inbound transfer.
-func (s *Service) prepareRecv(id, path string, size int64, sizeKnown bool, conflict string) (*pushResult, error) {
+// prepareRecv sets up (or resumes) an inbound transfer. peerID is the
+// authenticated remote device this transfer belongs to; every later data
+// stream, xfer.complete and xfer.cancel for id must come from that device.
+func (s *Service) prepareRecv(id, path string, size int64, sizeKnown bool, conflict, peerID string) (*pushResult, error) {
 	if id == "" || path == "" {
 		return nil, errors.New("id and path required")
 	}
@@ -357,10 +381,17 @@ func (s *Service) prepareRecv(id, path string, size int64, sizeKnown bool, confl
 	st := &recvState{
 		id: id, finalPath: final, partPath: part, f: f,
 		hash: h, offset: offset, size: size, sizeKnown: sizeKnown,
-		ready: make(chan struct{}), finDone: make(chan struct{}),
+		peerID: peerID,
+		ready:  make(chan struct{}), finDone: make(chan struct{}),
 	}
 	s.mu.Lock()
 	if old := s.recv[id]; old != nil {
+		if old.peerID != peerID {
+			// Another device owns this transfer id; refuse to disturb it
+			// (ids are 64-bit random, so this only matters if one is guessed).
+			s.mu.Unlock()
+			return nil, fmt.Errorf("no such transfer %s", id)
+		}
 		_ = old.f.Close()
 	}
 	s.recv[id] = st
@@ -379,15 +410,11 @@ func (s *Service) HandleStream(peer *session.Peer, _ proto.Chan, h *proto.DataHe
 		_ = st.Close()
 		return
 	}
-	rs.muSt.Lock()
-	if rs.peerID == "" {
-		rs.peerID = peer.ID
+	if rs.peerID != peer.ID {
+		s.log.Warn("file stream from wrong peer", "id", h.XferID, "owner", rs.peerID, "peer", peer.ID)
+		_ = st.Close()
+		return
 	}
-	if !rs.sizeKnown && rs.size == 0 {
-		// pull transfers learn the size via the xfer.pull response; nothing
-		// to do here.
-	}
-	rs.muSt.Unlock()
 
 	buf := make([]byte, pumpBuf)
 	lastReport := time.Now()
@@ -440,9 +467,16 @@ func (s *Service) finalize(id, expected string) error {
 	}
 	if expected != "" {
 		rs.muSt.Lock()
-		rs.expected = expected
+		already := rs.expected != ""
+		if !already {
+			rs.expected = expected
+		}
 		rs.muSt.Unlock()
-		close(rs.ready)
+		if already {
+			// Repeated xfer.complete for the same transfer: no-op success.
+			return nil
+		}
+		rs.readyOnce.Do(func() { close(rs.ready) })
 		return nil
 	}
 	// EOF path: wait briefly for xfer.complete to deliver the checksum.
@@ -510,6 +544,21 @@ func (s *Service) cancel(id string) {
 	}
 }
 
+// CancelAll aborts every in-flight inbound transfer (daemon exit): each
+// cancel closes the part file, removes the .rtpart file and finishes the
+// transfer with a "canceled" error. Safe to call with nothing in flight.
+func (s *Service) CancelAll() {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.recv))
+	for id := range s.recv {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	for _, id := range ids {
+		s.cancel(id)
+	}
+}
+
 func (s *Service) dropRecv(id string) {
 	s.mu.Lock()
 	delete(s.recv, id)
@@ -535,21 +584,30 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+// NewXferID returns a fresh transfer id. Callers that must know the id before
+// the transfer starts (e.g. the web API registers cancellation by id) can
+// pre-generate it and pass it into PushFile/PullFile.
+func NewXferID() string { return newID() }
+
 type progressFunc func(Progress)
 
-// PushFile sends one local file to a remote path.
-func (s *Service) PushFile(ctx context.Context, peer *session.Peer, localPath, remotePath, conflict string, onProg progressFunc) error {
+// PushFile sends one local file to a remote path. It returns the transfer id
+// (matching Progress.ID and the daemon's SSE xfer events); the call blocks
+// until the peer acknowledges the checksum. Pass a pre-generated NewXferID()
+// as id, or "" to generate one internally.
+func (s *Service) PushFile(ctx context.Context, peer *session.Peer, localPath, remotePath, conflict, id string, onProg progressFunc) (string, error) {
 	fi, err := os.Stat(localPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if fi.IsDir() {
-		return errors.New("use PushDir for directories")
+		return "", errors.New("use PushDir for directories")
 	}
-	return s.pushOne(ctx, peer, localPath, remotePath, fi.Size(), conflict, onProg)
+	return s.pushOne(ctx, peer, localPath, remotePath, fi.Size(), conflict, id, onProg)
 }
 
-// PushDir sends a directory tree to a remote directory.
+// PushDir sends a directory tree to a remote directory. It fans out to one
+// transfer per file, so there is no single transfer id to report.
 func (s *Service) PushDir(ctx context.Context, peer *session.Peer, localDir, remoteDir, conflict string, onProg progressFunc) error {
 	return filepath.WalkDir(localDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -567,20 +625,23 @@ func (s *Service) PushDir(ctx context.Context, peer *session.Peer, localDir, rem
 		if err != nil {
 			return err
 		}
-		return s.pushOne(ctx, peer, path, target, fi.Size(), conflict, onProg)
+		_, err = s.pushOne(ctx, peer, path, target, fi.Size(), conflict, "", onProg)
+		return err
 	})
 }
 
-func (s *Service) pushOne(ctx context.Context, peer *session.Peer, localPath, remotePath string, size int64, conflict string, onProg progressFunc) error {
-	id := newID()
+func (s *Service) pushOne(ctx context.Context, peer *session.Peer, localPath, remotePath string, size int64, conflict, id string, onProg progressFunc) (string, error) {
+	if id == "" {
+		id = newID()
+	}
 	name := filepath.Base(localPath)
 	var res pushResult
 	if err := peer.RPC(ctx, "xfer.push", pushParams{ID: id, Path: remotePath, Size: size, Conflict: conflict}, &res); err != nil {
-		return fmt.Errorf("peer rejected %s: %w", name, err)
+		return id, fmt.Errorf("peer rejected %s: %w", name, err)
 	}
 	f, err := os.Open(localPath)
 	if err != nil {
-		return err
+		return id, err
 	}
 	defer f.Close()
 	// Hash the resume prefix so the sender's checksum covers the whole file
@@ -588,12 +649,12 @@ func (s *Service) pushOne(ctx context.Context, peer *session.Peer, localPath, re
 	hash := sha256.New()
 	if res.Offset > 0 {
 		if _, err := io.CopyN(hash, f, res.Offset); err != nil {
-			return err
+			return id, err
 		}
 	}
 	st, err := peer.OpenData(proto.ChanFile, &proto.DataHeader{XferID: id})
 	if err != nil {
-		return err
+		return id, err
 	}
 	defer st.Close()
 
@@ -601,18 +662,32 @@ func (s *Service) pushOne(ctx context.Context, peer *session.Peer, localPath, re
 	buf := make([]byte, pumpBuf)
 	lastReport := time.Now()
 	report := func(state, errMsg string) {
+		p := Progress{ID: id, PeerID: peer.ID, Direction: "push", LocalPath: localPath, Name: name, Size: size, Done: done, State: state, Err: errMsg}
+		// Emit at service level too: daemon-wide subscribers (SSE → the CLI
+		// watchProgress and the web UI) must see sender-side progress even
+		// when the call passes no per-transfer callback.
+		s.progress(p)
 		if onProg != nil {
-			onProg(Progress{ID: id, PeerID: peer.ID, Direction: "push", LocalPath: localPath, Name: name, Size: size, Done: done, State: state, Err: errMsg})
+			onProg(p)
 		}
 	}
 	report("running", "")
 	for {
+		// Honor cancellation between chunks: the caller may cancel the
+		// transfer via /api/xfer/cancel (the ctx is the handler's).
+		select {
+		case <-ctx.Done():
+			report("error", ctx.Err().Error())
+			_ = peer.RPC(context.Background(), "xfer.cancel", cancelParams{ID: id}, nil)
+			return id, ctx.Err()
+		default:
+		}
 		n, rerr := f.Read(buf)
 		if n > 0 {
 			if _, werr := st.Write(buf[:n]); werr != nil {
 				report("error", werr.Error())
 				_ = peer.RPC(context.Background(), "xfer.cancel", cancelParams{ID: id}, nil)
-				return fmt.Errorf("send %s: %w", name, werr)
+				return id, fmt.Errorf("send %s: %w", name, werr)
 			}
 			hash.Write(buf[:n])
 			done += int64(n)
@@ -626,19 +701,23 @@ func (s *Service) pushOne(ctx context.Context, peer *session.Peer, localPath, re
 		}
 		if rerr != nil {
 			report("error", rerr.Error())
-			return rerr
+			return id, rerr
 		}
 	}
 	if err := peer.RPC(ctx, "xfer.complete", completeParams{ID: id, Sha256: hex.EncodeToString(hash.Sum(nil))}, nil); err != nil {
 		report("error", err.Error())
-		return err
+		return id, err
 	}
 	report("done", "")
-	return nil
+	return id, nil
 }
 
-// PullFile fetches a remote file into a local path.
-func (s *Service) PullFile(ctx context.Context, peer *session.Peer, remotePath, localPath, conflict string, onProg progressFunc) error {
+// PullFile fetches a remote file into a local path. It returns the transfer
+// id (matching Progress.ID and the daemon's SSE xfer events); the call
+// blocks until the transfer completes (or ctx is done).
+// PullFile fetches a remote file into a local path. Pass a pre-generated
+// NewXferID() as id, or "" to generate one internally.
+func (s *Service) PullFile(ctx context.Context, peer *session.Peer, remotePath, localPath, conflict, id string, onProg progressFunc) (string, error) {
 	if conflict == "" {
 		conflict = "rename"
 	}
@@ -649,22 +728,24 @@ func (s *Service) PullFile(ctx context.Context, peer *session.Peer, remotePath, 
 		switch conflict {
 		case "overwrite":
 		case "skip":
-			return fmt.Errorf("exists: %s", localPath)
+			return "", fmt.Errorf("exists: %s", localPath)
 		default:
 			localPath = uniquePath(localPath)
 		}
 	}
-	id := newID()
-	res, err := s.prepareRecv(id, localPath, 0, false, "overwrite")
+	if id == "" {
+		id = newID()
+	}
+	res, err := s.prepareRecv(id, localPath, 0, false, "overwrite", peer.ID)
 	if err != nil {
-		return err
+		return id, err
 	}
 	localPath = res.Path
 	s.mu.Lock()
 	rs := s.recv[id]
 	s.mu.Unlock()
 	if rs == nil {
-		return errors.New("receive state vanished")
+		return id, errors.New("receive state vanished")
 	}
 	rs.muSt.Lock()
 	offset := rs.offset
@@ -672,7 +753,7 @@ func (s *Service) PullFile(ctx context.Context, peer *session.Peer, remotePath, 
 	var pr pullResult
 	if err := peer.RPC(ctx, "xfer.pull", pullParams{ID: id, SrcPath: remotePath, Offset: offset}, &pr); err != nil {
 		s.cancel(id)
-		return err
+		return id, err
 	}
 	rs.muSt.Lock()
 	rs.size = pr.Size
@@ -680,17 +761,24 @@ func (s *Service) PullFile(ctx context.Context, peer *session.Peer, remotePath, 
 	rs.muSt.Unlock()
 	select {
 	case <-rs.finDone:
-		return rs.finErr
+		return id, rs.finErr
 	case <-ctx.Done():
 		s.cancel(id)
-		return ctx.Err()
+		return id, ctx.Err()
 	}
 }
 
 // sendStream is the xfer.pull handler on the sending side: open a data
 // stream to the requester and stream the file (resuming at offset), then
-// report the whole-file checksum.
+// report the whole-file checksum. It runs on its own goroutine (spawned by
+// the xfer.pull RPC handler), so it guards against panics taking down the
+// daemon.
 func (s *Service) sendStream(peer *session.Peer, id, srcPath string, size, offset int64) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.Error("filex goroutine panic", "panic", r)
+		}
+	}()
 	f, err := os.Open(srcPath)
 	if err != nil {
 		s.log.Warn("xfer.pull open failed", "path", srcPath, "err", err)
@@ -777,10 +865,24 @@ func (s *Service) Stat(ctx context.Context, peer *session.Peer, path string) (*s
 	return &res, err
 }
 
+// winDriveRe matches a Windows drive-letter root like "C:" at the start of a
+// remote base path.
+var winDriveRe = regexp.MustCompile(`^[A-Za-z]:`)
+
+// joinRemote appends rel to the remote base path, choosing the separator
+// from the REMOTE side's path style: we cannot query the peer's OS, so a
+// base that contains a backslash or a Windows drive prefix (C:) is treated
+// as Windows and everything else as POSIX. rel comes from filepath.* on the
+// LOCAL machine, so its separators are rewritten to the remote style; this
+// keeps a directory push from Windows to Linux from joining with "\".
 func joinRemote(base, rel string) string {
 	if rel == "." {
 		return base
 	}
-	clean := filepath.ToSlash(rel)
-	return strings.TrimRight(base, "/\\") + string(filepath.Separator) + filepath.FromSlash(clean)
+	if winDriveRe.MatchString(base) || strings.Contains(base, `\`) {
+		// Remote looks like Windows: join and normalize to backslashes.
+		return strings.TrimRight(base, `/\`) + `\` + strings.ReplaceAll(rel, `/`, `\`)
+	}
+	// Remote looks like POSIX: join and normalize to forward slashes.
+	return strings.TrimRight(base, `/\`) + `/` + strings.ReplaceAll(rel, `\`, `/`)
 }

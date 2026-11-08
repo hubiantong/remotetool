@@ -82,6 +82,13 @@ func activeInterfaces() []net.Interface {
 }
 
 func (m *MDNS) browseLoop(onEntry func(Entry)) {
+	// Long-lived background goroutine: log and die instead of crashing the
+	// daemon over a bad entry or resolver state.
+	defer func() {
+		if r := recover(); r != nil {
+			m.log.Error("mdns browse loop panic", "panic", r)
+		}
+	}()
 	resolver, err := zeroconf.NewResolver(nil)
 	if err != nil {
 		m.log.Warn("mdns resolver unavailable", "err", err)
@@ -140,10 +147,8 @@ func (m *MDNS) handle(e *zeroconf.ServiceEntry, onEntry func(Entry)) {
 	}
 	entry := Entry{ID: id, Name: name, Addr: addr}
 	m.mu.Lock()
-	_, seen := m.known[id]
 	m.known[id] = entry
 	m.mu.Unlock()
-	_ = seen
 	onEntry(entry)
 }
 

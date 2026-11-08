@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -79,5 +78,3 @@ func newLogger(verbose bool) *slog.Logger {
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, opts))
 }
-
-var _ = net.JoinHostPort

@@ -46,9 +46,9 @@ type Daemon struct {
 	pair  *PairService
 	mdns  *discover.MDNS
 
-	events     *web.EventHub
-	hubMu      sync.Mutex
-	hubClient  *session.HubClient
+	events    *web.EventHub
+	hubMu     sync.Mutex
+	hubClient *session.HubClient
 }
 
 // EventHub is re-exported from the web package.
@@ -178,6 +178,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		d.log.Info("shutting down")
 		_ = ln.Close()
+		// Order matters: kill PTYs first so no child shell outlives the
+		// daemon, then abort in-flight transfers, then close local forward
+		// listeners. The web server stops via its own ctx (3s grace).
+		d.term.Shutdown()
+		d.filex.CancelAll()
+		d.fwd.StopAll()
 		return nil
 	case err := <-webErr:
 		return err
@@ -197,7 +203,7 @@ func (d *Daemon) applyHub(ctx context.Context, addr, token string) {
 		d.mgr.SetHub(nil)
 		return
 	}
-	hc := session.NewHubClient(d.id, d.mgr, addr, token, d.log)
+	hc := session.NewHubClient(d.id, d.mgr, addr, token, d.store.Get().HubPubkey, d.log)
 	d.mgr.SetHub(hc)
 	d.hubMu.Lock()
 	d.hubClient = hc
@@ -282,6 +288,9 @@ func (d *Daemon) discovered() []discover.Entry {
 	return out
 }
 
+// maxFwdRulesPerPeer caps port-forwarding rules per peer device.
+const maxFwdRulesPerPeer = 32
+
 // webAPI builds the function-table the HTTP layer calls into.
 func (d *Daemon) webAPI() *web.API {
 	return &web.API{
@@ -314,7 +323,7 @@ func (d *Daemon) webAPI() *web.API {
 			d.applyHub(context.Background(), addr, token)
 			return nil
 		},
-		Peers:     func() any { return d.store.Peers() },
+		Peers: func() any { return d.store.Peers() },
 		RemovePeer: func(id string) error {
 			d.mgr.Disconnect(id)
 			return d.store.RemovePeer(id)
@@ -363,34 +372,62 @@ func (d *Daemon) webAPI() *web.API {
 			}
 			return d.filex.Remove(ctx, peer, path, recursive)
 		},
-		Push: func(ctx context.Context, peerArg, local, remote, conflict string) error {
+		Push: func(ctx context.Context, peerArg, local, remote, conflict string) (string, error) {
 			peer, err := d.resolvePeerArg(peerArg)
 			if err != nil {
-				return err
+				return "", err
 			}
-			bg := context.Background()
 			fi, statErr := os.Stat(local)
 			if statErr == nil && fi.IsDir() {
-				return d.filex.PushDir(bg, peer, local, remote, conflict, nil)
+				// Directory push fans out to one transfer per file; there is
+				// no single id, so it cannot be cancelled by id (the empty id
+				// is not registered by the web layer).
+				go func() {
+					if err := d.filex.PushDir(ctx, peer, local, remote, conflict, nil); err != nil {
+						d.log.Warn("push failed", "err", err)
+					}
+				}()
+				return "", nil
 			}
-			return d.filex.PushFile(bg, peer, local, remote, conflict, nil)
+			// Pre-generate the id so the HTTP response can carry it at once
+			// and /api/xfer/cancel can cancel via the handler ctx.
+			id := filex.NewXferID()
+			go func() {
+				if _, err := d.filex.PushFile(ctx, peer, local, remote, conflict, id, nil); err != nil {
+					d.log.Warn("push failed", "id", id, "err", err)
+				}
+			}()
+			return id, nil
 		},
-		Pull: func(ctx context.Context, peerArg, remote, local, conflict string) error {
+		Pull: func(ctx context.Context, peerArg, remote, local, conflict string) (string, error) {
 			peer, err := d.resolvePeerArg(peerArg)
 			if err != nil {
-				return err
+				return "", err
 			}
-			return d.filex.PullFile(context.Background(), peer, remote, local, conflict, nil)
+			id := filex.NewXferID()
+			go func() {
+				if _, err := d.filex.PullFile(ctx, peer, remote, local, conflict, id, nil); err != nil {
+					d.log.Warn("pull failed", "id", id, "err", err)
+				}
+			}()
+			return id, nil
 		},
 		FwdRules: func() any { return d.store.Get().FwdRules },
 		FwdAdd: func(rule config.FwdRule) error {
 			if rule.ID == "" {
 				rule.ID = fmt.Sprintf("f%d", time.Now().UnixNano())
 			}
-			err := d.store.Update(func(c *config.Config) {
-				c.FwdRules = append(c.FwdRules, rule)
-			})
-			if err != nil {
+			// Per-device cap: one peer cannot fill the config with rules.
+			n := 0
+			for _, r := range d.store.Get().FwdRules {
+				if r.PeerID == rule.PeerID {
+					n++
+				}
+			}
+			if n >= maxFwdRulesPerPeer {
+				return fmt.Errorf("too many fwd rules for this device (max %d)", maxFwdRulesPerPeer)
+			}
+			if err := d.store.AddFwdRule(rule); err != nil {
 				return err
 			}
 			if peer, ok := d.mgr.Get(rule.PeerID); ok {
@@ -402,16 +439,19 @@ func (d *Daemon) webAPI() *web.API {
 		},
 		FwdRemove: func(id string) error {
 			var rule config.FwdRule
-			rules := d.store.Get().FwdRules
-			out := rules[:0]
-			for _, r := range rules {
+			found := false
+			for _, r := range d.store.Get().FwdRules {
 				if r.ID == id {
-					rule = r
-					continue
+					rule, found = r, true
+					break
 				}
-				out = append(out, r)
 			}
-			if err := d.store.Update(func(c *config.Config) { c.FwdRules = out }); err != nil {
+			if !found {
+				return nil
+			}
+			// Mutate the store only through its API: Get() returns a copy, so
+			// the old in-place filter-rewrite here corrupted s.cfg.
+			if err := d.store.RemoveFwdRule(id); err != nil {
 				return err
 			}
 			d.fwd.StopRule(rule)

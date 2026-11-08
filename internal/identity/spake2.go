@@ -20,13 +20,16 @@ import (
 // are derived at init time via try-and-increment SHA-256 (fixed, so neither
 // party can influence them per session).
 //
-// Channel binding: each side mixes *its own TLS channel exporter* into the
-// transcript. On a direct connection both exporters are equal; a machine-in-
-// the-middle terminating two TLS channels produces different values, so key
-// confirmation fails and the relay attack is rejected.
+// Channel binding: each side mixes *its own TLS channel-binding material*
+// into the transcript — the transport.CertBinding hash ("rtd/cb/v1"
+// domain-separated SHA-256 over both leaf-certificate DERs, sorted). On a
+// direct connection both sides derive the same value; a machine-in-the-middle
+// terminating two TLS channels sees different certificate pairs, so key
+// confirmation fails and the relay attack is rejected. (This is NOT a TLS
+// exporter; see internal/transport.CertBinding.)
 
 var (
-	p256          = elliptic.P256()
+	p256           = elliptic.P256()
 	p256Mx, p256My = hashToPoint("rtd/spake2/M")
 	p256Nx, p256Ny = hashToPoint("rtd/spake2/N")
 )
@@ -51,7 +54,8 @@ type SPAKE2 struct {
 }
 
 // NewSPAKE2 starts a handshake. idA/idB are the two device ids (initiator
-// first) and channelBind is the local TLS exporter material.
+// first) and channelBind is the local channel-binding material
+// (transport.CertBinding output).
 func NewSPAKE2(role Role, password, idA, idB, channelBind []byte) (*SPAKE2, error) {
 	if len(password) == 0 {
 		return nil, errors.New("empty pairing password")

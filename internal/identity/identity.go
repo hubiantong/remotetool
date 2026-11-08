@@ -112,6 +112,10 @@ func (id *Identity) TLSCertificate() tls.Certificate {
 
 // VerifyFunc validates a peer leaf certificate by recomputing its device id
 // and delegating to verify. The certificate must be self-signed Ed25519.
+// Validity period / CA constraints are intentionally NOT checked: device
+// identities are long-lived (NotAfter +20y) and every peer cert is
+// self-signed — authentication comes from the pinned pubkey (verify) or the
+// pairing code plus channel binding, never from a WebPKI-style chain.
 func VerifyFunc(rawCerts [][]byte, verify func(id string, pub ed25519.PublicKey) error) error {
 	if len(rawCerts) == 0 {
 		return errors.New("peer presented no certificate")

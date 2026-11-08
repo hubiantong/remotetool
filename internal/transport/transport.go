@@ -51,6 +51,9 @@ type Listener interface {
 const (
 	keepAlivePeriod = 15 * time.Second
 	maxIdleTimeout  = 90 * time.Second
+	// openStreamTimeout bounds Open: if the peer's stream quota is exhausted,
+	// OpenStreamSync would otherwise block forever on context.Background().
+	openStreamTimeout = 30 * time.Second
 )
 
 func qcfg() *quic.Config {
@@ -63,13 +66,17 @@ func qcfg() *quic.Config {
 }
 
 type quicConn struct {
-	c    *quic.Conn
-	id   string
-	own  []byte // our leaf certificate DER (for channel binding)
+	c   *quic.Conn
+	id  string
+	own []byte // our leaf certificate DER (for channel binding)
 }
 
 func (q *quicConn) Open() (Stream, error) {
-	s, err := q.c.OpenStreamSync(context.Background())
+	// Internal deadline: with the peer's stream quota exhausted,
+	// OpenStreamSync blocks forever unless the context carries a timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), openStreamTimeout)
+	defer cancel()
+	s, err := q.c.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -84,9 +91,9 @@ func (q *quicConn) Accept() (Stream, error) {
 	return quicStream{s}, nil
 }
 
-func (q *quicConn) RemoteID() string    { return q.id }
+func (q *quicConn) RemoteID() string     { return q.id }
 func (q *quicConn) RemoteAddr() net.Addr { return q.c.RemoteAddr() }
-func (q *quicConn) Close() error        { return q.c.CloseWithError(quic.ApplicationErrorCode(0), "closed") }
+func (q *quicConn) Close() error         { return q.c.CloseWithError(quic.ApplicationErrorCode(0), "closed") }
 
 func (q *quicConn) RemotePub() ed25519.PublicKey {
 	st := q.c.ConnectionState()
@@ -104,12 +111,14 @@ func (q *quicConn) ChannelBinding() []byte {
 	if len(st.TLS.PeerCertificates) > 0 {
 		peer = st.TLS.PeerCertificates[0].Raw
 	}
-	return certBinding(own, peer)
+	return CertBinding(own, peer)
 }
 
-// certBinding is symmetric: equal for both ends of a direct connection,
-// different across a MITM (the peer certificate differs on each leg).
-func certBinding(own, peer []byte) []byte {
+// CertBinding is the SPAKE2 channel binding: a "rtd/cb/v1" domain-separated
+// SHA-256 over both leaf certificate DERs (sorted, so the result is
+// symmetric). It is equal for both ends of a direct connection, different
+// across a machine-in-the-middle (the peer certificate differs on each leg).
+func CertBinding(own, peer []byte) []byte {
 	a, b := string(own), string(peer)
 	if a > b {
 		a, b = b, a

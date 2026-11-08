@@ -20,7 +20,9 @@ import (
 	"remotetool/internal/config"
 )
 
-const version = "0.1.0"
+// version is a var so build.sh's -ldflags "-X main.version=..." can stamp
+// the real version (git describe) at link time; a const would ignore it.
+var version = "0.1.0"
 
 func main() {
 	flag.Usage = usage
@@ -305,41 +307,118 @@ func cmdCp(args []string) error {
 		return fmt.Errorf("usage: rt cp <src> <dst>   (one side as <device>:<path>)")
 	}
 	src, dst := args[0], args[1]
-	srcRemote := strings.Contains(src, ":")
-	dstRemote := strings.Contains(dst, ":")
-	if srcRemote == dstRemote {
+	// Fast path: without any colon neither side can name a remote device, so
+	// report the usage error without a daemon round-trip.
+	if !strings.Contains(src, ":") && !strings.Contains(dst, ":") {
 		return fmt.Errorf("exactly one side must be <device>:<path>")
 	}
 	c, err := newClient()
 	if err != nil {
 		return err
 	}
+	// A side is remote only when the text before its first colon names a
+	// paired device; a Windows local path (C:\data\f.zip) matches no device
+	// and stays local.
+	srcDev, srcPath, srcRemote := resolveRemotePrefix(c, src)
+	dstDev, dstPath, dstRemote := resolveRemotePrefix(c, dst)
+	if srcRemote == dstRemote {
+		return fmt.Errorf("exactly one side must be <device>:<path>")
+	}
+	var res struct {
+		OK bool   `json:"ok"`
+		ID string `json:"id"` // transfer id ("" on older daemons: watch all)
+	}
 	if dstRemote {
-		dev, path := splitRemote(dst)
 		err = c.postJSON("/api/xfer/push", map[string]string{
-			"peer": dev, "local": src, "remote": path, "conflict": "rename",
-		}, nil)
+			"peer": dstDev, "local": src, "remote": dstPath, "conflict": "rename",
+		}, &res)
 	} else {
-		dev, path := splitRemote(src)
 		err = c.postJSON("/api/xfer/pull", map[string]string{
-			"peer": dev, "remote": path, "local": dst, "conflict": "rename",
-		}, nil)
+			"peer": srcDev, "remote": srcPath, "local": dst, "conflict": "rename",
+		}, &res)
 	}
 	if err != nil {
 		return err
 	}
-	return watchProgress(c)
+	return watchProgress(c, res.ID)
 }
 
-func splitRemote(s string) (dev, path string) {
+// peerEntry is one paired/connected device as reported by /api/status.
+type peerEntry struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// listPeers fetches the known devices from the daemon.
+func listPeers(c *client) ([]peerEntry, error) {
+	var st struct {
+		Connected []peerEntry `json:"connected"`
+		Peers     []peerEntry `json:"peers"`
+	}
+	if err := c.getJSON("/api/status", &st); err != nil {
+		return nil, err
+	}
+	out := make([]peerEntry, 0, len(st.Peers)+len(st.Connected))
+	seen := map[string]bool{}
+	for _, p := range append(st.Connected, st.Peers...) {
+		if p.ID == "" || seen[p.ID] {
+			continue
+		}
+		seen[p.ID] = true
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// resolveRemotePrefix decides whether s is "<device>:<remote path>" and
+// splits it. The candidate prefix (text before the first colon) counts as a
+// device only if it matches a paired device's name exactly (case-insensitive)
+// or is a prefix of its device id. A single-letter candidate is treated as a
+// Windows drive letter and never matches an id prefix (hex ids can start
+// with any letter, so "C:\..." must not match an id starting with 'c').
+// ok is false when s is local — or when the peer list cannot be fetched.
+func resolveRemotePrefix(c *client, s string) (dev, rest string, ok bool) {
 	i := strings.Index(s, ":")
-	return s[:i], s[i+1:]
+	if i <= 0 {
+		return "", "", false
+	}
+	prefix, rest := s[:i], s[i+1:]
+	peers, err := listPeers(c)
+	if err != nil {
+		return "", "", false
+	}
+	for _, p := range peers {
+		if p.Name != "" && strings.EqualFold(prefix, p.Name) {
+			return prefix, rest, true
+		}
+	}
+	if len(prefix) > 1 {
+		for _, p := range peers {
+			if strings.HasPrefix(strings.ToLower(p.ID), strings.ToLower(prefix)) {
+				return prefix, rest, true
+			}
+		}
+	}
+	return "", "", false
 }
 
-// watchProgress reads the SSE stream and prints transfer events.
-func watchProgress(c *client) error {
-	req, _ := http.NewRequest(http.MethodGet, c.base+"/api/events?t="+url.QueryEscape(c.tok), nil)
-	resp, err := c.hc.Do(req)
+// sseClient has no global Timeout: /api/events is a long-lived SSE stream and
+// the 60s default client timeout would abort it mid-transfer.
+var sseClient = &http.Client{}
+
+// watchProgress reads the SSE stream and prints transfer events. When xferID
+// is non-empty only events for that transfer are shown, so a concurrent
+// `rt cp` on the same daemon cannot terminate this one early; an empty
+// xferID (older daemon, directory push) watches every transfer.
+func watchProgress(c *client, xferID string) error {
+	eventsURL := c.base + "/api/events?t=" + url.QueryEscape(c.tok)
+	if xferID != "" {
+		// Ask the daemon to replay this transfer's latest event on connect:
+		// a fast transfer may be finished before the subscription attaches.
+		eventsURL += "&xfer=" + url.QueryEscape(xferID)
+	}
+	req, _ := http.NewRequest(http.MethodGet, eventsURL, nil)
+	resp, err := sseClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -356,6 +435,7 @@ func watchProgress(c *client) error {
 		var ev struct {
 			Type string `json:"type"`
 			Data struct {
+				ID        string `json:"id"`
 				Direction string `json:"direction"`
 				Name      string `json:"name"`
 				Size      int64  `json:"size"`
@@ -365,6 +445,9 @@ func watchProgress(c *client) error {
 			} `json:"data"`
 		}
 		if json.Unmarshal([]byte(line[6:]), &ev) != nil || ev.Type != "xfer" {
+			continue
+		}
+		if xferID != "" && ev.Data.ID != xferID {
 			continue
 		}
 		pct := ""

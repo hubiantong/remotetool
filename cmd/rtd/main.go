@@ -13,17 +13,21 @@ import (
 	"remotetool/internal/daemon"
 )
 
+// version is a var so build.sh's -ldflags "-X main.version=..." can stamp
+// the real version (git describe) at link time.
+var version = "0.1.0"
+
 func main() {
 	home := flag.String("home", "", "config directory (default: per-OS app data dir)")
 	name := flag.String("name", "", "device display name")
 	listenPort := flag.Int("listen-port", 0, "QUIC listen port (default 27183)")
 	webPort := flag.Int("web-port", 0, "web UI port (default 27180)")
 	verbose := flag.Bool("v", false, "verbose logging")
-	version := flag.Bool("version", false, "print version")
+	showVersion := flag.Bool("version", false, "print version")
 	flag.Parse()
 
-	if *version {
-		fmt.Println("rtd 0.1.0")
+	if *showVersion {
+		fmt.Printf("rtd %s\n", version)
 		return
 	}
 

@@ -11,7 +11,10 @@ const qs = new URLSearchParams(location.search);
 if (qs.get("t")) { TOKEN = qs.get("t"); localStorage.setItem("rt_token", TOKEN); history.replaceState(null, "", location.pathname); }
 
 async function api(method, path, body) {
-  const opt = { method, headers: { "X-RT-Token": TOKEN } };
+  const opt = { method, headers: {} };
+  // Without a stored token rely on the rt_token cookie the server seeded from
+  // the ?t= handoff; sending an empty header would break that flow.
+  if (TOKEN) opt.headers["X-RT-Token"] = TOKEN;
   if (body !== undefined) {
     opt.headers["Content-Type"] = "application/json";
     opt.body = JSON.stringify(body);
@@ -72,9 +75,9 @@ function showGate() {
   $("#gate").classList.remove("hidden");
   $("#app").classList.add("hidden");
 }
-$("#gate-btn").addEventListener("click", tryGate);
+$("#gate-btn").addEventListener("click", () => tryGate());
 $("#gate-token").addEventListener("keydown", (e) => { if (e.key === "Enter") tryGate(); });
-async function tryGate() {
+async function tryGate(silent) {
   TOKEN = $("#gate-token").value.trim() || TOKEN;
   try {
     await api("GET", "/api/status");
@@ -83,10 +86,14 @@ async function tryGate() {
     $("#app").classList.remove("hidden");
     boot();
   } catch (e) {
-    $("#gate-err").textContent = e.message === "unauthorized" ? "令牌错误" : e.message;
+    showGate();
+    if (!silent) $("#gate-err").textContent = e.message === "unauthorized" ? "令牌错误" : e.message;
   }
 }
-if (TOKEN) tryGate(); else showGate();
+// With no stored token the first /api/status call authenticates through the
+// rt_token cookie seeded by the server's ?t= redirect; only a 401 falls back
+// to the gate (kept free of an error line until the user retries).
+if (TOKEN) tryGate(); else tryGate(true);
 
 // ----------------------------------------------------------------- boot ---
 

@@ -11,7 +11,10 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -27,11 +30,20 @@ var webdistFS embed.FS
 // webdist is the embedded UI file tree.
 var webdist, _ = fs.Sub(webdistFS, "webdist")
 
-// EventHub broadcasts daemon events to SSE subscribers.
+// EventHub broadcasts daemon events to SSE subscribers. For xfer events it
+// also remembers the latest event per transfer id (bounded), so a subscriber
+// that attaches after a short transfer finished still sees its terminal
+// state — the CLI's watchProgress would otherwise wait forever for a "done"
+// event that was published before it connected.
 type EventHub struct {
-	mu   sync.Mutex
-	subs map[chan []byte]struct{}
+	mu        sync.Mutex
+	subs      map[chan []byte]struct{}
+	last      map[string][]byte // xfer id -> latest marshaled event
+	lastOrder []string          // insertion order for bounded eviction
 }
+
+// maxTrackedXfers bounds the last-event cache.
+const maxTrackedXfers = 512
 
 // NewEventHub builds an empty hub.
 func NewEventHub() *EventHub { return &EventHub{subs: map[chan []byte]struct{}{}} }
@@ -42,17 +54,55 @@ func MarshalEvent(eventType, peerID string, data any) []byte {
 	return b
 }
 
-// Publish drops the event into every subscriber (non-blocking).
+// Publish drops the event into every subscriber (non-blocking) and, for xfer
+// events, records the latest event per transfer id.
 func (h *EventHub) Publish(eventType, peerID string, data any) {
 	b := MarshalEvent(eventType, peerID, data)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if eventType == "xfer" {
+		var probe struct {
+			Data struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(b, &probe) == nil && probe.Data.ID != "" {
+			h.rememberLocked(probe.Data.ID, b)
+		}
+	}
 	for ch := range h.subs {
 		select {
 		case ch <- b:
 		default:
 		}
 	}
+}
+
+// rememberLocked stores the latest event for one xfer id (h.mu held).
+func (h *EventHub) rememberLocked(id string, b []byte) {
+	if h.last == nil {
+		h.last = map[string][]byte{}
+	}
+	if _, exists := h.last[id]; !exists {
+		if len(h.last) >= maxTrackedXfers {
+			// Evict the oldest tracked transfer.
+			if len(h.lastOrder) > 0 {
+				old := h.lastOrder[0]
+				h.lastOrder = h.lastOrder[1:]
+				delete(h.last, old)
+			}
+		}
+		h.lastOrder = append(h.lastOrder, id)
+	}
+	h.last[id] = b
+}
+
+// lastXfer returns the latest event recorded for a transfer id.
+func (h *EventHub) lastXfer(id string) ([]byte, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	b, ok := h.last[id]
+	return b, ok
 }
 
 // Subscribe registers a subscriber; the returned func unsubscribes.
@@ -84,8 +134,13 @@ type API struct {
 	Mkdir   func(ctx context.Context, peerArg, path string) error
 	Rename  func(ctx context.Context, peerArg, from, to string) error
 	Remove  func(ctx context.Context, peerArg, path string, recursive bool) error
-	Push    func(ctx context.Context, peerArg, local, remote, conflict string) error
-	Pull    func(ctx context.Context, peerArg, remote, local, conflict string) error
+	// Push/Pull start a transfer and return its id promptly so the handler can
+	// answer before the transfer finishes; the transfer itself runs under the
+	// given ctx and must stop when it is cancelled (see /api/xfer/cancel).
+	// For Push, src is the local path and dst the remote path; for Pull the
+	// order is reversed.
+	Push func(ctx context.Context, peerArg, src, dst, conflict string) (string, error)
+	Pull func(ctx context.Context, peerArg, src, dst, conflict string) (string, error)
 
 	FwdRules  func() any
 	FwdAdd    func(rule config.FwdRule) error
@@ -99,10 +154,14 @@ type API struct {
 
 // Server is the HTTP layer.
 type Server struct {
-	log   *slog.Logger
-	token string
-	api   *API
-	hub   *EventHub
+	log     *slog.Logger
+	token   string
+	api     *API
+	hub     *EventHub
+	webPort string // actual listen port, set by Run
+
+	xferMu      sync.Mutex
+	xferCancels map[string]context.CancelFunc // lazily initialized in trackXfer
 }
 
 // NewServer builds the web server.
@@ -114,14 +173,28 @@ func NewServer(log *slog.Logger, token string, api *API, hub *EventHub) *Server 
 func (s *Server) Run(ctx context.Context, addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/", s.auth(s.apiHandler))
-	mux.Handle("/api/term/ws", s.authHandler(websocket.Handler(s.termWS)))
+	mux.Handle("/api/term/ws", s.authHandler(s.wsOrigin(websocket.Handler(s.termWS))))
 	mux.HandleFunc("/api/events", s.auth(s.events))
 	mux.HandleFunc("/", s.static)
 
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	// Remember the port actually bound: addr may use :0, and the WS Origin
+	// check must match what the browser really talks to.
+	if _, port, perr := net.SplitHostPort(ln.Addr().String()); perr == nil {
+		s.webPort = port
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
@@ -161,12 +234,72 @@ func (s *Server) authHandler(next http.Handler) http.Handler {
 	return s.auth(next.ServeHTTP)
 }
 
-func (s *Server) static(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/")
-	if path == "" {
-		path = "index.html"
+// wsOrigin guards the terminal WebSocket against cross-site WebSocket
+// hijacking: any web page the operator visits could otherwise open a terminal
+// on the local daemon, because browsers attach loopback credentials
+// automatically and the same-origin policy does not govern WebSocket
+// upgrades. Browsers always send Origin on the handshake; an empty Origin
+// means a non-browser client (CLI, termprobe) and is allowed.
+func (s *Server) wsOrigin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" && !s.sameOrigin(origin) {
+			http.Error(w, "cross-origin websocket refused", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sameOrigin reports whether origin points at this server's own loopback
+// address and port (http or https).
+func (s *Server) sameOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
 	}
-	b, err := fs.ReadFile(webdist, path)
+	host := u.Hostname()
+	if host != "127.0.0.1" && !strings.EqualFold(host, "localhost") {
+		return false
+	}
+	port := u.Port()
+	if port == "" {
+		// A portless loopback origin cannot come from a browser (browsers
+		// always send the port unless it is the scheme default, and this
+		// server never listens on 80/443). It is the signature of the
+		// repo's own x/net/websocket CLI clients (e.g. termprobe), which
+		// dial with "http://127.0.0.1" — accept it like an empty Origin.
+		return true
+	}
+	return port == s.webPort
+}
+
+func (s *Server) static(w http.ResponseWriter, r *http.Request) {
+	// Token handoff for the SPA: /?t=<token> seeds the rt_token cookie (which
+	// the auth middleware reads back) and 302s to the clean URL so the token
+	// does not linger in the address bar or browser history. A wrong token
+	// must not serve the UI.
+	if t := r.URL.Query().Get("t"); t != "" {
+		if t != s.token {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "rt_token",
+			Value:    s.token,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		// path.Clean keeps the redirect target local: a path like //host
+		// would otherwise be treated as protocol-relative by browsers.
+		http.Redirect(w, r, path.Clean("/"+r.URL.Path), http.StatusFound)
+		return
+	}
+	file := strings.TrimPrefix(r.URL.Path, "/")
+	if file == "" {
+		file = "index.html"
+	}
+	b, err := fs.ReadFile(webdist, file)
 	if err != nil {
 		// SPA fallback.
 		b, err = fs.ReadFile(webdist, "index.html")
@@ -174,18 +307,18 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ui missing", http.StatusInternalServerError)
 			return
 		}
-		path = "index.html"
+		file = "index.html"
 	}
 	switch {
-	case strings.HasSuffix(path, ".html"):
+	case strings.HasSuffix(file, ".html"):
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	case strings.HasSuffix(path, ".js"):
+	case strings.HasSuffix(file, ".js"):
 		w.Header().Set("Content-Type", "application/javascript")
-	case strings.HasSuffix(path, ".css"):
+	case strings.HasSuffix(file, ".css"):
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	case strings.HasSuffix(path, ".svg"):
+	case strings.HasSuffix(file, ".svg"):
 		w.Header().Set("Content-Type", "image/svg+xml")
-	case strings.HasSuffix(path, ".woff2"):
+	case strings.HasSuffix(file, ".woff2"):
 		w.Header().Set("Content-Type", "font/woff2")
 	}
 	w.Header().Set("Cache-Control", "no-cache")
@@ -199,9 +332,11 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func readBody[T any](r *http.Request) (*T, error) {
+func readBody[T any](w http.ResponseWriter, r *http.Request) (*T, error) {
 	var v T
-	if err := json.NewDecoder(r.Body).Decode(&v); err != nil {
+	// Cap decoded bodies so a stray client cannot make the daemon buffer
+	// unbounded JSON.
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&v); err != nil {
 		return nil, err
 	}
 	return &v, nil
@@ -213,257 +348,25 @@ func errJSON(w http.ResponseWriter, err error) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
 
+// apiHandler is the top-level /api/ router: it delegates by resource prefix
+// to the per-resource dispatchers (api_peer.go, api_file.go, api_fwd.go,
+// api_term.go). Every dispatcher ends in http.NotFound for unmatched paths
+// or methods, so behavior is identical to the previous single switch; the
+// dispatchers are mutually exclusive by prefix and peerAPI also covers the
+// default case for unknown /api/ paths.
 func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	p := r.URL.Path
 	switch {
-	case r.URL.Path == "/api/status" && r.Method == http.MethodGet:
-		writeJSON(w, s.api.Status())
-
-	case r.URL.Path == "/api/name" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			Name string `json:"name"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		if err := s.api.SetName(body.Name); err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/hub" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			Addr  string `json:"addr"`
-			Token string `json:"token"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		if err := s.api.SetHub(strings.TrimSpace(body.Addr), strings.TrimSpace(body.Token)); err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/pair/invite" && r.Method == http.MethodPost:
-		code, expires, err := s.api.CreateInvite()
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]any{"code": code, "expires": expires.UnixMilli()})
-
-	case r.URL.Path == "/api/pair/connect" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			Addr string `json:"addr"`
-			Code string `json:"code"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		peer, err := s.api.PairConnect(cctx, body.Addr, body.Code)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]any{"ok": true, "peer": peer})
-
-	case r.URL.Path == "/api/peers/connect" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			ID string `json:"id"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		if err := s.api.ConnectPeer(cctx, body.ID); err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/peers/disconnect" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			ID string `json:"id"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		s.api.DisconnectPeer(body.ID)
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/peers/remove" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			ID string `json:"id"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		if err := s.api.RemovePeer(body.ID); err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/fs/list" && r.Method == http.MethodGet:
-		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		res, err := s.api.ListDir(cctx, r.URL.Query().Get("peer"), r.URL.Query().Get("path"))
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, res)
-
-	case r.URL.Path == "/api/fs/mkdir" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			Peer string `json:"peer"`
-			Path string `json:"path"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		if err := s.api.Mkdir(cctx, body.Peer, body.Path); err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/fs/rename" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			Peer string `json:"peer"`
-			From string `json:"from"`
-			To   string `json:"to"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		if err := s.api.Rename(cctx, body.Peer, body.From, body.To); err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/fs/remove" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			Peer      string `json:"peer"`
-			Path      string `json:"path"`
-			Recursive bool   `json:"recursive"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if err := s.api.Remove(cctx, body.Peer, body.Path, body.Recursive); err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/xfer/push" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			Peer     string `json:"peer"`
-			Local    string `json:"local"`
-			Remote   string `json:"remote"`
-			Conflict string `json:"conflict"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		// Validate connectivity synchronously, then transfer in background.
-		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		if _, err := s.api.ListDir(cctx, body.Peer, "."); err != nil {
-			cancel()
-			errJSON(w, err)
-			return
-		}
-		cancel()
-		go func() {
-			bg, bgCancel := context.WithTimeout(context.Background(), 24*time.Hour)
-			defer bgCancel()
-			if err := s.api.Push(bg, body.Peer, body.Local, body.Remote, body.Conflict); err != nil {
-				s.log.Warn("push failed", "err", err)
-			}
-		}()
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/xfer/pull" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			Peer     string `json:"peer"`
-			Remote   string `json:"remote"`
-			Local    string `json:"local"`
-			Conflict string `json:"conflict"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		if _, err := s.api.ListDir(cctx, body.Peer, "."); err != nil {
-			cancel()
-			errJSON(w, err)
-			return
-		}
-		cancel()
-		go func() {
-			bg, bgCancel := context.WithTimeout(context.Background(), 24*time.Hour)
-			defer bgCancel()
-			if err := s.api.Pull(bg, body.Peer, body.Remote, body.Local, body.Conflict); err != nil {
-				s.log.Warn("pull failed", "err", err)
-			}
-		}()
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/fwd" && r.Method == http.MethodGet:
-		writeJSON(w, map[string]any{"rules": s.api.FwdRules(), "active": s.api.FwdActive()})
-
-	case r.URL.Path == "/api/fwd/add" && r.Method == http.MethodPost:
-		body, err := readBody[config.FwdRule](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		if err := s.api.FwdAdd(*body); err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-
-	case r.URL.Path == "/api/fwd/remove" && r.Method == http.MethodPost:
-		body, err := readBody[struct {
-			ID string `json:"id"`
-		}](r)
-		if err != nil {
-			errJSON(w, err)
-			return
-		}
-		if err := s.api.FwdRemove(body.ID); err != nil {
-			errJSON(w, err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-
+	case strings.HasPrefix(p, "/api/fs/") || strings.HasPrefix(p, "/api/xfer/"):
+		s.fileAPI(w, r)
+	case p == "/api/fwd" || strings.HasPrefix(p, "/api/fwd/"):
+		s.fwdAPI(w, r)
+	case strings.HasPrefix(p, "/api/term/"):
+		// /api/term/ws never reaches here (the mux routes it to termWS);
+		// termAPI 404s the rest, as the old switch's default did.
+		s.termAPI(w, r)
 	default:
-		http.NotFound(w, r)
+		s.peerAPI(w, r)
 	}
 }
 
@@ -480,6 +383,16 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	defer unsub()
 	_, _ = fmt.Fprint(w, "retry: 3000\n\n")
 	fl.Flush()
+	// A client may attach after its transfer already finished (the CLI
+	// subscribes only once the push/pull call returned): replay the latest
+	// recorded event for the requested transfer so it sees the terminal
+	// state instead of waiting forever.
+	if id := r.URL.Query().Get("xfer"); id != "" {
+		if b, ok := s.hub.lastXfer(id); ok {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+			fl.Flush()
+		}
+	}
 	heartbeat := time.NewTicker(20 * time.Second)
 	defer heartbeat.Stop()
 	for {

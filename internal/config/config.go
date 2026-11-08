@@ -44,13 +44,20 @@ type Peer struct {
 
 // Config is config.json.
 type Config struct {
-	Name       string    `json:"name"`
-	ListenPort int       `json:"listen_port"`
-	WebPort    int       `json:"web_port"`
-	WebToken   string    `json:"web_token"`
-	HubAddr    string    `json:"hub_addr,omitempty"` // self-hosted hub (signaling + encrypted relay)
-	HubToken   string    `json:"hub_token,omitempty"`
-	FwdRules   []FwdRule `json:"fwd_rules,omitempty"`
+	Name       string `json:"name"`
+	ListenPort int    `json:"listen_port"`
+	WebPort    int    `json:"web_port"`
+	WebToken   string `json:"web_token"`
+	HubAddr    string `json:"hub_addr,omitempty"` // self-hosted hub (signaling + encrypted relay)
+	HubToken   string `json:"hub_token,omitempty"`
+	// HubPubkey optionally pins the hub's certificate: base16 SHA-256 of the
+	// hub's leaf certificate DER. Empty = do not verify the hub certificate.
+	HubPubkey string `json:"hub_pubkey,omitempty"`
+	// AllowNonLoopbackFwd permits port-forward listeners on non-loopback
+	// addresses. Default false: listeners are forced to 127.0.0.1.
+	AllowNonLoopbackFwd bool `json:"allow_non_loopback_fwd,omitempty"`
+
+	FwdRules []FwdRule `json:"fwd_rules,omitempty"`
 }
 
 // Store owns the config directory: config.json + peers.json.
@@ -98,6 +105,7 @@ func (s *Store) Dir() string { return s.dir }
 func (s *Store) loadConfig() error {
 	path := filepath.Join(s.dir, "config.json")
 	b, err := os.ReadFile(path)
+	dirty := false
 	switch {
 	case os.IsNotExist(err):
 		host, _ := os.Hostname()
@@ -107,27 +115,38 @@ func (s *Store) loadConfig() error {
 			WebPort:    DefaultWebPort,
 			WebToken:   randHex(16),
 		}
-		return s.saveLocked()
+		dirty = true
 	case err != nil:
 		return err
 	}
-	if err := json.Unmarshal(b, &s.cfg); err != nil {
-		return fmt.Errorf("parse %s: %w", path, err)
+	if len(b) > 0 {
+		if err := json.Unmarshal(b, &s.cfg); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
 	}
 	if s.cfg.Name == "" {
 		host, _ := os.Hostname()
 		s.cfg.Name = host
+		dirty = true
 	}
 	if s.cfg.ListenPort == 0 {
 		s.cfg.ListenPort = DefaultListenPort
+		dirty = true
 	}
 	if s.cfg.WebPort == 0 {
 		s.cfg.WebPort = DefaultWebPort
+		dirty = true
 	}
 	if s.cfg.WebToken == "" {
 		s.cfg.WebToken = randHex(16)
+		dirty = true
 	}
-	return s.saveLocked()
+	// Save only when something was seeded: an unconditional write makes two
+	// concurrent readers (e.g. two `rt` processes) race on the rename.
+	if dirty {
+		return s.saveLocked()
+	}
+	return nil
 }
 
 func (s *Store) loadPeers() error {
@@ -169,12 +188,54 @@ func (s *Store) savePeersLocked() error {
 	return atomicWrite(filepath.Join(s.dir, "peers.json"), b)
 }
 
-// Get returns a copy of the current config.
+// Get returns a copy of the current config. The FwdRules slice is deep-copied
+// so callers can never mutate the stored rules through the returned value.
 func (s *Store) Get() Config {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := s.cfg
+	// Copy unconditionally: even a zero-length slice may carry a live backing
+	// array (e.g. left behind by RemoveFwdRule), and a caller appending to the
+	// returned slice would otherwise write into the store's array.
+	c.FwdRules = append([]FwdRule(nil), c.FwdRules...)
 	return c
+}
+
+// AddFwdRule inserts or replaces a rule (matched by ID) and persists.
+func (s *Store) AddFwdRule(rule FwdRule) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	replaced := false
+	for i := range s.cfg.FwdRules {
+		if s.cfg.FwdRules[i].ID == rule.ID {
+			s.cfg.FwdRules[i] = rule
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		s.cfg.FwdRules = append(s.cfg.FwdRules, rule)
+	}
+	return s.saveLocked()
+}
+
+// RemoveFwdRule deletes the rule with the given id and persists. Returns an
+// error if no such rule exists.
+func (s *Store) RemoveFwdRule(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := -1
+	for i := range s.cfg.FwdRules {
+		if s.cfg.FwdRules[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("no fwd rule %q", id)
+	}
+	s.cfg.FwdRules = append(s.cfg.FwdRules[:idx], s.cfg.FwdRules[idx+1:]...)
+	return s.saveLocked()
 }
 
 // Update applies fn to the config and persists it.

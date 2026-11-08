@@ -5,7 +5,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"regexp"
@@ -25,7 +24,7 @@ func main() {
 
 	u := fmt.Sprintf("ws://127.0.0.1:%s/api/term/ws?peer=%s&cols=100&rows=30&t=%s",
 		port, url.QueryEscape(peer), url.QueryEscape(tok))
-	ws, err := websocket.Dial(u, "", "http://127.0.0.1")
+	ws, err := websocket.Dial(u, "", fmt.Sprintf("http://127.0.0.1:%s", port))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "dial:", err)
 		os.Exit(1)
@@ -51,7 +50,9 @@ func main() {
 	// Drain initial banner, then send the command and look for the prompt
 	// returning with our marker.
 	time.Sleep(800 * time.Millisecond)
-	for len(out) > 0 { <-out }
+	for len(out) > 0 {
+		<-out
+	}
 	ws.Write([]byte(cmd + "\r\n"))
 
 	deadline := time.Now().Add(12 * time.Second)
@@ -91,5 +92,3 @@ func stripANSI(s string) string {
 	re := regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r`)
 	return re.ReplaceAllString(s, "")
 }
-
-var _ = io.EOF

@@ -26,13 +26,13 @@ type PTY interface {
 }
 
 var (
-	modkernel32              = windows.NewLazySystemDLL("kernel32.dll")
-	procCreatePseudoConsole  = modkernel32.NewProc("CreatePseudoConsole")
-	procResizePseudoConsole  = modkernel32.NewProc("ResizePseudoConsole")
-	procClosePseudoConsole   = modkernel32.NewProc("ClosePseudoConsole")
-	procInitAttrList         = modkernel32.NewProc("InitializeProcThreadAttributeList")
-	procUpdateAttr           = modkernel32.NewProc("UpdateProcThreadAttribute")
-	procDeleteAttrList       = modkernel32.NewProc("DeleteProcThreadAttributeList")
+	modkernel32             = windows.NewLazySystemDLL("kernel32.dll")
+	procCreatePseudoConsole = modkernel32.NewProc("CreatePseudoConsole")
+	procResizePseudoConsole = modkernel32.NewProc("ResizePseudoConsole")
+	procClosePseudoConsole  = modkernel32.NewProc("ClosePseudoConsole")
+	procInitAttrList        = modkernel32.NewProc("InitializeProcThreadAttributeList")
+	procUpdateAttr          = modkernel32.NewProc("UpdateProcThreadAttribute")
+	procDeleteAttrList      = modkernel32.NewProc("DeleteProcThreadAttributeList")
 )
 
 func conptyAvailable() bool { return procCreatePseudoConsole.Find() == nil }
@@ -84,8 +84,8 @@ type startupInfoEx struct {
 }
 
 const (
-	extendedStartupInfoPresent = 0x00080000
-	createUnicodeEnvironment   = 0x00000400
+	extendedStartupInfoPresent  = 0x00080000
+	createUnicodeEnvironment    = 0x00000400
 	procThreadAttrPseudoconsole = 0x00020016
 )
 

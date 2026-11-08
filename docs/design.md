@@ -19,11 +19,13 @@
 - **证书**：自签名 X.509（Ed25519），QUIC 握手双向出示；`ClientAuth: RequireAnyClientCert`，
   CA 校验完全让位于**证书钉扎**（对端公钥必须等于已配对记录）。
 - **配对协议**（借鉴 UU 的 8 位协助码模式，去中心化）：
-  1. B 生成 6 位配对码（5 分钟、单次有效），A 在有效期内输入；
+  1. B 生成 6 位配对码（5 分钟、单次有效；连续错码 5 次即作废邀请，并按来源
+     指数退避；未配对连接另有并发信号量 + 令牌桶配额），A 在有效期内输入；
   2. 双方在 TLS 信道内运行 **SPAKE2-P256**（密码=配对码），密钥确认双向 HMAC；
-  3. **通道绑定**：SPAKE2 transcript 混入各自 TLS 信道的证书指纹对
-     （`H(sorted(own_leaf, peer_leaf))`）。直连时两端一致；MITM 终结两条信道时
-     不一致 → 确认失败。这同时防住了 PAKE 的透明转发攻击；
+  3. **通道绑定**：SPAKE2 transcript 混入证书对哈希 `transport.CertBinding`——
+     以 `"rtd/cb/v1"` 为域分隔前缀，对双方叶证书 DER 按字典序排序后拼接，
+     再做 SHA-256（对称，与 TLS exporter 无关）。直连时两端一致；MITM 终结
+     两条信道时对端证书不同 → 确认失败。这同时防住了 PAKE 的透明转发攻击；
   4. 成功后双方落盘 `peers.json`（ID/名称/公钥/最近地址）。
 - 实现位置：`internal/identity/spake2.go`（M/N 常量 try-and-increment 派生，带
   错码/MITM/非法点单测）、`internal/daemon/pair.go`。
@@ -40,12 +42,14 @@
 
 - **控制流**（每连接 1 条，拨号方打开）：u32 前缀 JSON 帧多路复用请求/响应/
   通知（`internal/proto/rpc.go`）。方法：`hello`、`pair.*`、`fs.*`、`xfer.*`、
-  `term.open/resize/close/list`、`fwd.listen/unlisten`。
+  `term.open/resize/close/list`、`fwd.listen/unlisten/grant`。
 - **数据流**（按需多条）：首字节信道类型 + u32 前缀 JSON 头，其后为纯二进制：
   - `ChanTerm`：会话 id 定位，之后为 PTY 原始字节（输入输出同流）；
   - `ChanFile`：传输 id 定位，从续传偏移起的文件字节；
-  - `ChanFwd`：`Dial`（对端拨目标）或 `RuleID`（反向监听回连）定位，之后为
-    转发 TCP 连接的双向字节。
+  - `ChanFwd`：仅 `RuleID` 定位——拨号目标不上网线（旧版头部携带 `Dial`
+    目标的行为已被移除并拒绝），接收侧校验来源后自行解析目标：mode L 走
+    规则所有者经 `fwd.grant` 登记的授权（随连接断开失效），mode R 用本机
+    自己的配置规则；之后为转发 TCP 连接的双向字节。
 
 借鉴 UU 的 16 字节 `TERM` 帧头思路（type+sessionId+len），改为「头 JSON +
 裸字节」，QUIC 流本身已是消息边界可靠的字节流，无需分块帧。
@@ -58,8 +62,11 @@
     2016）自动降级为管道模式（`-NoLogo`/`chcp 65001` 缓解，无 ANSI）；
   - Unix：`creack/pty` fork/exec，`$SHELL`，TERM=xterm-256color。
 - **会话存活 + 回放**（借鉴 UU 的 tmux 思路但内建）：客户端断开不杀会话；
-  服务端持续把输出写入 256KB 环形缓冲，重连/刷新页面时先回放缓冲
-  （`ClientAttach` + `term.attach` 路径）。
+  服务端持续把输出写入 256KB 环形缓冲，重连/刷新页面时重新挂接 `ChanTerm`
+  数据流即先回放缓冲再衔接新输出——不存在 `term.attach` RPC，重挂就是数据
+  流本身（客户端封装为 `ClientAttach`）。
+- **归属隔离**：会话属于 `term.open` 的调用设备；`term.resize/close/list` 与
+  数据流挂接只作用于自己的会话，他人会话一律按“不存在”处理（不泄露存在性）。
 - 前端 xterm.js（vendor 本地化，无 CDN）；CLI `rt term` 原始模式
   （unix SIGWINCH / windows 轮询 resize）。
 
@@ -92,7 +99,8 @@ fs 浏览操作：`fs.list/mkdir/rename/remove/stat`（`fs.list` 空路径在 Wi
     后纯转发两条流（早到流缓存防竞态）。两条流内部再跑一层**设备证书的
     TLS 1.3 + yamux**（`muxConn`），因此 hub 只见密文；ChannelBinding 与
     直连一致，配对/钉扎语义不变；
-  - 拨号顺序：LastAddr → mDNS 候选 → hub 解析地址 → 直连全败走中继。
+  - 拨号顺序：LastAddr → mDNS 候选 → hub 解析地址 → 直连全败走中继；
+  - hub 证书可选指纹钉扎（配置 `hub_pubkey`；未配置时启动告警“未校验 hub 证书”）。
 - **未做**：UDP 打洞（v0.2 路线图）；hub 集群/多 token。
 
 ## 7. Web UI 与 CLI

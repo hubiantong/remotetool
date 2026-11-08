@@ -4,13 +4,11 @@ package session
 
 import (
 	"context"
-	"crypto/ed25519"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"remotetool/internal/config"
@@ -32,6 +30,10 @@ type Peer struct {
 	Name string
 	Caps []string
 	Addr string
+
+	// activeStreams counts this peer's concurrent data streams (bounded by
+	// maxPeerStreams) so one device cannot eat the whole connection quota.
+	activeStreams atomic.Int32
 
 	conn transport.Conn
 	rpc  *proto.RPCConn
@@ -184,32 +186,6 @@ func (m *Manager) caps() []string {
 	return out
 }
 
-// AddCandidate records a reachable address for a peer (mDNS / hub / manual).
-func (m *Manager) AddCandidate(peerID, addr string) {
-	if peerID == m.id.ID {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	set := m.cand[peerID]
-	if set == nil {
-		set = map[string]bool{}
-		m.cand[peerID] = set
-	}
-	set[addr] = true
-}
-
-// Candidates lists known addresses for a peer, last successful one first.
-func (m *Manager) Candidates(peerID string) []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var out []string
-	for a := range m.cand[peerID] {
-		out = append(out, a)
-	}
-	return out
-}
-
 // Connected returns all currently connected peers.
 func (m *Manager) Connected() []*Peer {
 	m.mu.Lock()
@@ -261,89 +237,6 @@ func (m *Manager) Connect(ctx context.Context, peerID string) (*Peer, error) {
 	return p, err
 }
 
-func (m *Manager) pinVerify() func(string, ed25519.PublicKey) error {
-	store := m.store
-	return func(id string, pub ed25519.PublicKey) error {
-		p, ok := store.Peer(id)
-		if !ok {
-			return fmt.Errorf("unknown device %s", id)
-		}
-		if string(p.PubKey) != string(pub) {
-			return fmt.Errorf("device %s key mismatch (possible attack)", id)
-		}
-		return nil
-	}
-}
-
-func (m *Manager) dialPeer(ctx context.Context, peerID string) (*Peer, error) {
-	peer, ok := m.store.Peer(peerID)
-	if !ok {
-		return nil, fmt.Errorf("not paired with %s", peerID)
-	}
-	var addrs []string
-	if peer.LastAddr != "" {
-		addrs = append(addrs, peer.LastAddr)
-	}
-	addrs = append(addrs, m.Candidates(peerID)...)
-	m.mu.Lock()
-	hub := m.hub
-	m.mu.Unlock()
-	if hub != nil {
-		if a, ok := hub.Resolve(ctx, peerID); ok {
-			addrs = append(addrs, a)
-		}
-	}
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("no known address for %s (%s)", peer.Name, peerID)
-	}
-	var lastErr error
-	for _, a := range addrs {
-		if _, _, err := net.SplitHostPort(a); err != nil {
-			a = net.JoinHostPort(a, fmt.Sprint(config.DefaultListenPort))
-		}
-		dctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-		conn, err := transport.Dial(dctx, a, m.id.TLSConfig(m.pinVerify()))
-		cancel()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if conn.RemoteID() != peerID {
-			_ = conn.Close()
-			return nil, fmt.Errorf("address %s serves device %s, expected %s", a, conn.RemoteID(), peerID)
-		}
-		p, err := m.dialHandshake(conn, a)
-		if err != nil {
-			_ = conn.Close()
-			lastErr = err
-			continue
-		}
-		return p, nil
-	}
-	if lastErr == nil {
-		lastErr = errors.New("unreachable")
-	}
-	// Direct dialing failed: fall back to the hub relay (end-to-end
-	// encrypted, the hub only pipes ciphertext).
-	if hub != nil {
-		conn, err := hub.Relay(ctx, peerID)
-		if err != nil {
-			return nil, fmt.Errorf("connect %s: %w (relay: %v)", peer.Name, lastErr, err)
-		}
-		if conn.RemoteID() != peerID {
-			_ = conn.Close()
-			return nil, fmt.Errorf("relay served device %s, expected %s", conn.RemoteID(), peerID)
-		}
-		p, err := m.dialHandshake(conn, "relay")
-		if err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("connect %s via relay: %w", peer.Name, err)
-		}
-		return p, nil
-	}
-	return nil, fmt.Errorf("connect %s: %w", peer.Name, lastErr)
-}
-
 // ServeListener accepts inbound pin-verified connections forever. Pairing
 // runs on a separate short-lived listener (pair service).
 func (m *Manager) ServeListener(l transport.Listener) {
@@ -384,7 +277,7 @@ func (m *Manager) ConnectAddr(ctx context.Context, addr string) (*Peer, error) {
 	if err != nil {
 		return nil, err
 	}
-	p, err := m.dialHandshake(conn, addr)
+	p, err := m.dialHandshake(ctx, conn, addr)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -396,109 +289,10 @@ func (m *Manager) myHello() hello {
 	return hello{ID: m.id.ID, Name: m.store.Get().Name, Caps: m.caps()}
 }
 
-// dialHandshake: we opened the connection, we open the control stream and
-// initiate hello.
-func (m *Manager) dialHandshake(conn transport.Conn, addr string) (*Peer, error) {
-	ctl, err := conn.Open()
-	if err != nil {
-		return nil, err
-	}
-	rc := proto.NewRPCConn(ctl)
-	go rc.Serve()
-	rc.Handle("hello", func(params json.RawMessage) (any, error) {
-		return m.myHello(), nil
-	})
-	var their hello
-	if err := rc.Call(context.Background(), "hello", m.myHello(), &their); err != nil {
-		_ = ctl.Close()
-		return nil, fmt.Errorf("hello: %w", err)
-	}
-	return m.register(conn, rc, addr, their), nil
-}
-
-// acceptHandshake: peer dialed us; accept the control stream and answer.
-func (m *Manager) acceptHandshake(conn transport.Conn, addr string) (*Peer, error) {
-	ctl, err := conn.Accept()
-	if err != nil {
-		return nil, err
-	}
-	rc := proto.NewRPCConn(ctl)
-	var their hello
-	rc.Handle("hello", func(params json.RawMessage) (any, error) {
-		if err := json.Unmarshal(params, &their); err != nil {
-			return nil, err
-		}
-		return m.myHello(), nil
-	})
-	m.mu.Lock()
-	pa := m.pairAttach
-	m.mu.Unlock()
-	if pa != nil {
-		pa(conn, rc)
-	}
-	// Wait for the dialer's hello (handler runs on the Serve goroutine).
-	done := make(chan struct{})
-	rc.OnNotify = func(string, json.RawMessage) {}
-	go func() {
-		rc.Serve()
-		close(done)
-	}()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if their.ID != "" {
-			break
-		}
-		select {
-		case <-done:
-			return nil, errors.New("connection closed during hello")
-		case <-time.After(25 * time.Millisecond):
-		}
-	}
-	if their.ID == "" {
-		return nil, errors.New("hello timeout")
-	}
-	return m.register(conn, rc, addr, their), nil
-}
-
-// register wires a verified connection into the manager and starts its
-// data-stream dispatch loop.
-func (m *Manager) register(conn transport.Conn, rc *proto.RPCConn, addr string, their hello) *Peer {
-	peerID := conn.RemoteID()
-	p := &Peer{ID: peerID, Name: their.Name, Caps: their.Caps, Addr: addr, conn: conn, rpc: rc, mgr: m}
-
-	m.mu.Lock()
-	features := append([]Feature{}, m.features...)
-	pa := m.pairAttach
-	if old, ok := m.conns[peerID]; ok && old != p {
-		// Glare or reconnect: keep the newest connection.
-		m.mu.Unlock()
-		old.shutdown()
-		m.mu.Lock()
-	}
-	m.conns[peerID] = p
-	m.mu.Unlock()
-	for _, f := range features {
-		f.AttachRPC(p, rc)
-	}
-	if pa != nil {
-		pa(conn, rc)
-	}
-	m.store.TouchPeer(peerID, addr)
-
-	go func() {
-		<-rc.Done()
-		m.mu.Lock()
-		if cur, ok := m.conns[peerID]; ok && cur == p {
-			delete(m.conns, peerID)
-		}
-		m.mu.Unlock()
-		m.emit(Event{Type: "peer_down", PeerID: peerID})
-	}()
-	go m.dispatchLoop(p)
-	m.emit(Event{Type: "peer_up", PeerID: peerID, Data: map[string]any{"name": p.Name}})
-	m.log.Info("peer connected", "id", peerID, "name", p.Name, "addr", addr)
-	return p
-}
+// maxPeerStreams caps one peer's concurrent data streams (ChanFile/ChanFwd/
+// ChanTerm all flow through dispatchLoop), so a single device cannot eat the
+// connection's whole stream quota (512).
+const maxPeerStreams = 64
 
 // dispatchLoop accepts data streams and routes them to features.
 func (m *Manager) dispatchLoop(p *Peer) {
@@ -519,7 +313,14 @@ func (m *Manager) dispatchLoop(p *Peer) {
 		for _, f := range features {
 			if f.Chan() == ch {
 				handled = true
+				if p.activeStreams.Add(1) > maxPeerStreams {
+					p.activeStreams.Add(-1)
+					m.log.Warn("peer stream limit reached", "peer", p.ID, "chan", ch)
+					_ = s.Close()
+					break
+				}
 				go func() {
+					defer p.activeStreams.Add(-1)
 					defer func() {
 						if r := recover(); r != nil {
 							m.log.Error("feature handler panic", "feature", f.Name(), "panic", r)

@@ -100,7 +100,7 @@ resize 等），数据流按类型复用（`ChanTerm`/`ChanFile`/`ChanFwd`）。
 
 ## 依赖
 
-Go 1.25；运行时零依赖。第三方库：quic-go、yamux、zeroconf、creack/pty、
+Go 1.26；运行时零依赖。第三方库：quic-go、yamux、zeroconf、creack/pty、
 x/sys、x/term、x/net（详见 go.mod）。
 
 ## 已验证

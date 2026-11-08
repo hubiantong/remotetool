@@ -58,37 +58,48 @@ type sessionInfo struct {
 
 // Session is one live PTY owned by the server.
 type Session struct {
-	ID   uint64
-	cols uint16
-	rows uint16
+	ID    uint64
+	owner string // device that opened the session; others must not see it
+	cols  uint16
+	rows  uint16
 
 	pty PTY
 
 	mu       sync.Mutex
 	stream   transport.Stream // attached client stream, may be nil
 	ring     []byte
+	ringBase int           // absolute offset of ring[0] in the pty output
+	outCur   int           // absolute offset already sent to the attachment
+	replay   bool          // next pump run sends the whole ring (fresh attach)
+	notify   chan struct{} // wakes the pump; buffered, sent non-blocking
 	exitCode int32
 	done     chan struct{}
-	once     sync.Once
 }
 
-func (s *Service) Name() string   { return "term" }
+// startPTY is the PTY constructor; a var so tests can inject a fake.
+var startPTY = StartPTY
+
+func (s *Service) Name() string     { return "term" }
 func (s *Service) Chan() proto.Chan { return proto.ChanTerm }
 
-func (s *Service) AttachRPC(_ *session.Peer, rc *proto.RPCConn) {
+func (s *Service) AttachRPC(peer *session.Peer, rc *proto.RPCConn) {
+	owner := ""
+	if peer != nil {
+		owner = peer.ID
+	}
 	rc.Handle("term.open", func(params json.RawMessage) (any, error) {
 		var p openParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		return s.open(p)
+		return s.open(owner, p)
 	})
 	rc.Handle("term.resize", func(params json.RawMessage) (any, error) {
 		var p sessionIDParams
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		sess := s.get(p.Session)
+		sess := s.getOwned(owner, p.Session)
 		if sess == nil {
 			return nil, fmt.Errorf("no such session %d", p.Session)
 		}
@@ -99,7 +110,7 @@ func (s *Service) AttachRPC(_ *session.Peer, rc *proto.RPCConn) {
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
 		}
-		sess := s.get(p.Session)
+		sess := s.getOwned(owner, p.Session)
 		if sess == nil {
 			return nil, nil
 		}
@@ -107,34 +118,37 @@ func (s *Service) AttachRPC(_ *session.Peer, rc *proto.RPCConn) {
 		return nil, nil
 	})
 	rc.Handle("term.list", func(params json.RawMessage) (any, error) {
-		return s.list(), nil
+		return s.list(owner), nil
 	})
 }
 
-func (s *Service) open(p openParams) (*openResult, error) {
+func (s *Service) open(owner string, p openParams) (*openResult, error) {
 	if p.Cols == 0 {
 		p.Cols = 80
 	}
 	if p.Rows == 0 {
 		p.Rows = 24
 	}
-	pty, err := StartPTY(p.Cols, p.Rows, p.Shell, p.Cwd)
+	pty, err := startPTY(p.Cols, p.Rows, p.Shell, p.Cwd)
 	if err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	s.nextID++
 	sess := &Session{
-		ID:   s.nextID,
-		cols: p.Cols,
-		rows: p.Rows,
-		pty:  pty,
-		ring: make([]byte, 0, scrollback),
-		done: make(chan struct{}),
+		ID:     s.nextID,
+		owner:  owner,
+		cols:   p.Cols,
+		rows:   p.Rows,
+		pty:    pty,
+		ring:   make([]byte, 0, scrollback),
+		notify: make(chan struct{}, 1),
+		done:   make(chan struct{}),
 	}
 	s.sessions[sess.ID] = sess
 	s.mu.Unlock()
 	go s.readLoop(sess)
+	go s.pump(sess)
 	go func() {
 		code, _ := pty.Wait()
 		sess.mu.Lock()
@@ -159,11 +173,26 @@ func (s *Service) get(id uint64) *Session {
 	return s.sessions[id]
 }
 
-func (s *Service) list() []sessionInfo {
+// getOwned returns the session only if it exists and belongs to owner, so a
+// foreign device cannot reach another device's sessions.
+func (s *Service) getOwned(owner string, id uint64) *Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess := s.sessions[id]
+	if sess == nil || sess.owner != owner {
+		return nil
+	}
+	return sess
+}
+
+func (s *Service) list(owner string) []sessionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]sessionInfo, 0, len(s.sessions))
 	for _, sess := range s.sessions {
+		if sess.owner != owner {
+			continue
+		}
 		sess.mu.Lock()
 		code := sess.exitCode
 		c, r := sess.cols, sess.rows
@@ -173,8 +202,31 @@ func (s *Service) list() []sessionInfo {
 	return out
 }
 
-// readLoop pumps pty output to the attached stream and the scrollback ring.
+// Shutdown kills every live PTY (daemon exit). The per-session waiter
+// goroutines started in open perform the map cleanup and close done, so this
+// needs no extra bookkeeping and is a no-op on an empty session table.
+func (s *Service) Shutdown() {
+	s.mu.Lock()
+	sessions := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+	for _, sess := range sessions {
+		_ = sess.pty.Kill()
+	}
+}
+
+// readLoop reads pty output into the scrollback ring and wakes the pump; it
+// never touches the attached stream, the pump is its only writer.
 func (s *Service) readLoop(sess *Session) {
+	// A long-lived per-session goroutine: log and die instead of taking the
+	// whole daemon down.
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.Error("term goroutine panic", "panic", r)
+		}
+	}()
 	buf := make([]byte, 32<<10)
 	for {
 		n, err := sess.pty.Read(buf)
@@ -183,18 +235,64 @@ func (s *Service) readLoop(sess *Session) {
 			sess.mu.Lock()
 			sess.ring = append(sess.ring, data...)
 			if len(sess.ring) > scrollback {
-				sess.ring = sess.ring[len(sess.ring)-scrollback:]
+				drop := len(sess.ring) - scrollback
+				sess.ring = sess.ring[drop:]
+				sess.ringBase += drop
 			}
-			st := sess.stream
 			sess.mu.Unlock()
-			if st != nil {
-				if _, werr := st.Write(data); werr != nil {
-					s.detach(sess, st)
-				}
+			select {
+			case sess.notify <- struct{}{}:
+			default:
 			}
 		}
 		if err != nil {
 			return
+		}
+	}
+}
+
+// pump is the single goroutine that writes output to the attached stream: on
+// wake it sends a full ring replay (fresh attach) or the not-yet-sent tail.
+func (s *Service) pump(sess *Session) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.Error("term goroutine panic", "panic", r)
+		}
+	}()
+	for {
+		select {
+		case <-sess.notify:
+		case <-sess.done:
+			return
+		}
+		sess.mu.Lock()
+		st := sess.stream
+		if st == nil {
+			sess.mu.Unlock()
+			continue // nobody attached; data stays in the ring for the replay
+		}
+		var data []byte
+		if sess.replay {
+			data = append([]byte(nil), sess.ring...)
+			sess.replay = false
+		} else {
+			if sess.outCur < sess.ringBase {
+				sess.outCur = sess.ringBase // scrolled out; replay covers it
+			}
+			data = append([]byte(nil), sess.ring[sess.outCur-sess.ringBase:]...)
+		}
+		sess.outCur = sess.ringBase + len(sess.ring)
+		sess.mu.Unlock()
+		if len(data) == 0 {
+			continue
+		}
+		if _, werr := st.Write(data); werr != nil {
+			sess.mu.Lock()
+			if sess.stream == st {
+				sess.stream = nil
+			}
+			sess.mu.Unlock()
+			_ = st.Close()
 		}
 	}
 }
@@ -219,25 +317,25 @@ func (s *Service) detach(sess *Session, st transport.Stream) {
 }
 
 // HandleStream attaches an inbound data stream to the requested session.
+// Streams from devices that do not own the session are closed without any
+// hint the session exists.
 func (s *Service) HandleStream(peer *session.Peer, _ proto.Chan, h *proto.DataHeader, st transport.Stream) {
 	sess := s.get(h.Session)
-	if sess == nil {
+	if sess == nil || sess.owner != peer.ID {
 		_ = st.Close()
 		return
 	}
 	sess.mu.Lock()
 	old := sess.stream
 	sess.stream = st
-	ring := append([]byte(nil), sess.ring...)
+	sess.replay = true
 	sess.mu.Unlock()
+	select {
+	case sess.notify <- struct{}{}:
+	default:
+	}
 	if old != nil {
 		_ = old.Close() // replaced by the new attachment
-	}
-	if len(ring) > 0 {
-		if _, err := st.Write(ring); err != nil {
-			s.detach(sess, st)
-			return
-		}
 	}
 	// Client -> pty (stdin).
 	buf := make([]byte, 32<<10)
