@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RT 远程</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%234f7cff'/><path d='M30 72V28h22c12 0 20 7 20 18 0 9-5 15-13 17l15 9h-15L46 64H42v8z' fill='white'/></svg>">
+</head>
+<body>
+
+<!-- token gate -->
+<div id="gate" class="gate hidden">
+  <div class="gate-card">
+    <div class="logo-badge">RT</div>
+    <h1>RT 远程</h1>
+    <p>输入访问令牌（<code>rt url</code> 可查看）</p>
+    <input id="gate-token" type="password" placeholder="访问令牌" autocomplete="off">
+    <button id="gate-btn" class="btn primary">进入</button>
+    <p id="gate-err" class="err"></p>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo-badge sm">RT</div><div><b>RT 远程</b><span id="side-name">…</span></div></div>
+    <nav>
+      <a data-page="devices" class="nav-item active"><span class="ic">◈</span>设备</a>
+      <a data-page="term" class="nav-item"><span class="ic">▌</span>终端</a>
+      <a data-page="files" class="nav-item"><span class="ic">▣</span>文件</a>
+      <a data-page="fwd" class="nav-item"><span class="ic">⇄</span>转发</a>
+      <a data-page="settings" class="nav-item"><span class="ic">⚙</span>设置</a>
+    </nav>
+    <div class="sidebar-foot">
+      <span id="side-id" class="mono dim" title="设备ID"></span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- ===================== devices ===================== -->
+    <section id="page-devices" class="page active">
+      <h2>设备</h2>
+      <div class="grid2">
+        <div class="card">
+          <h3>允许配对</h3>
+          <p class="dim">在另一台设备上输入下面的配对码（5 分钟内有效，用后即废）。</p>
+          <div id="invite-box" class="invite-box">
+            <button id="invite-btn" class="btn primary">生成配对码</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>连接其他设备</h3>
+          <p class="dim">先在对方设备上生成配对码，再在这里输入它的地址与配对码。</p>
+          <div class="form-row"><input id="pair-addr" placeholder="对方地址，如 192.168.1.20:27183" spellcheck="false"></div>
+          <div class="form-row"><input id="pair-code" placeholder="6 位配对码" maxlength="6" inputmode="numeric" class="mono"></div>
+          <button id="pair-btn" class="btn primary">配对</button>
+          <span id="pair-msg" class="msg"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>已配对设备</h3>
+        <div id="peer-list" class="peer-list"></div>
+      </div>
+
+      <div class="card">
+        <h3>局域网发现</h3>
+        <div id="discover-list" class="peer-list"></div>
+      </div>
+    </section>
+
+    <!-- ===================== term ===================== -->
+    <section id="page-term" class="page">
+      <div class="term-head">
+        <h2>终端</h2>
+        <select id="term-peer"></select>
+        <button id="term-open" class="btn primary">新建会话</button>
+      </div>
+      <div id="term-tabs" class="term-tabs"></div>
+      <div id="term-panes" class="term-panes">
+        <div class="term-empty dim">尚未打开终端。选择设备后点击「新建会话」。</div>
+      </div>
+    </section>
+
+    <!-- ===================== files ===================== -->
+    <section id="page-files" class="page">
+      <div class="term-head">
+        <h2>文件</h2>
+        <select id="fs-peer"></select>
+        <span id="fs-progress-summary" class="dim"></span>
+      </div>
+      <div class="files-grid">
+        <div class="pane" id="pane-local">
+          <div class="pane-head"><b>本机</b>
+            <span class="pane-actions">
+              <button data-act="up" class="icon-btn" title="上级目录">↑</button>
+              <button data-act="refresh" class="icon-btn" title="刷新">⟳</button>
+              <button data-act="mkdir" class="icon-btn" title="新建文件夹">＋</button>
+            </span>
+          </div>
+          <div class="pane-path mono" id="path-local"></div>
+          <div class="pane-list" id="list-local"></div>
+        </div>
+        <div class="pane" id="pane-remote">
+          <div class="pane-head"><b>远端</b>
+            <span class="pane-actions">
+              <button data-act="up" class="icon-btn" title="上级目录">↑</button>
+              <button data-act="refresh" class="icon-btn" title="刷新">⟳</button>
+              <button data-act="mkdir" class="icon-btn" title="新建文件夹">＋</button>
+            </span>
+          </div>
+          <div class="pane-path mono" id="path-remote"></div>
+          <div class="pane-list" id="list-remote"></div>
+        </div>
+      </div>
+      <div class="card transfers">
+        <h3>传输 <span id="xfer-clear" class="link">清空</span></h3>
+        <div id="xfer-list" class="xfer-list"></div>
+      </div>
+    </section>
+
+    <!-- ===================== fwd ===================== -->
+    <section id="page-fwd" class="page">
+      <h2>端口转发</h2>
+      <div class="card">
+        <h3>添加规则</h3>
+        <div class="fwd-form">
+          <select id="fwd-peer"></select>
+          <select id="fwd-mode">
+            <option value="L">-L 本机监听，经远端访问目标</option>
+            <option value="R">-R 远端监听，转回本机目标</option>
+          </select>
+          <input id="fwd-listen-port" placeholder="监听端口" class="mono" style="max-width:110px">
+          <span class="dim">→</span>
+          <input id="fwd-target-host" placeholder="目标主机" value="localhost" style="max-width:150px">
+          <input id="fwd-target-port" placeholder="目标端口" class="mono" style="max-width:110px">
+          <button id="fwd-add" class="btn primary">添加</button>
+        </div>
+        <p class="dim" id="fwd-hint">-L 例：本机 13389 → 远端 localhost:3389，连本机 13389 即访问远端远程桌面。</p>
+      </div>
+      <div class="card">
+        <h3>规则列表</h3>
+        <div id="fwd-list" class="peer-list"></div>
+      </div>
+    </section>
+
+    <!-- ===================== settings ===================== -->
+    <section id="page-settings" class="page">
+      <h2>设置</h2>
+      <div class="card">
+        <h3>本机</h3>
+        <div class="form-row"><label>设备名</label><input id="set-name" spellcheck="false"></div>
+        <button id="set-save" class="btn primary">保存</button>
+      </div>
+      <div class="card">
+        <h3>身份</h3>
+        <p class="mono dim" id="set-id"></p>
+        <p class="dim">设备ID由 Ed25519 公钥指纹生成，配对时钉扎校验，杜绝中间人。</p>
+      </div>
+      <div class="card">
+        <h3>自建 hub（跨公网）</h3>
+        <p class="dim">在一台 VPS 上运行 <code>hub</code> 后填入地址，出差时设备经 hub 信令/中继互联；中继只传输端到端密文。</p>
+        <div class="form-row"><label>hub 地址</label><input id="set-hub" placeholder="如 hub.example.com:27190（留空关闭）" spellcheck="false"></div>
+        <div class="form-row"><label>hub 令牌</label><input id="set-hub-token" placeholder="hub 启动时设置的 token" spellcheck="false"></div>
+        <button id="set-hub-save" class="btn primary">保存 hub</button>
+        <span id="set-hub-msg" class="msg"></span>
+      </div>
+      <div class="card">
+        <h3>关于</h3>
+        <p class="dim">RT 远程 v0.1 · 端到端加密（TLS 1.3 + 证书钉扎）· 配对采用 SPAKE2 + 通道绑定 · 局域网 mDNS 直连 · 自建 hub 中继</p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
